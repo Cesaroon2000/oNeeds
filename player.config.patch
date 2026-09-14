@@ -1,0 +1,7 @@
+[
+  {
+    "op" : "add",
+    "path" : "/genericScriptContexts/oneeds",
+    "value" : "/scripts/oneeds/player.lua"
+  }
+]

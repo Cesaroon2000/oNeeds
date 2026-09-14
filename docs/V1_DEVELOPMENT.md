@@ -1,0 +1,640 @@
+# oNeeds V1.14.0 development notes
+
+## Architecture and persistence
+
+oNeeds V1 is a standalone OpenStarbound generic player-script context named
+oneeds. It does not replace vanilla, FU, or FrackinInterface assets and does
+not ship individual consumable or furniture patches.
+
+This is the OpenStarbound port of xNeeds. The runtime architecture is
+unchanged; the OpenStarbound-specific adaptations are the `interface.queueMessage`
+status API, the `world.biomeAt` result shape, and the renamed
+`oneeds`-prefixed assets, effects, storage key, and commands.
+
+Persistent player data uses schema 2:
+
+    storage.needs = {
+      version = 2,
+      thirst = 0,
+      fatigue = 0,
+      bladder = 0,
+      hygiene = 100
+    }
+
+All values are clamped to 0 through 100. Higher Thirst, Fatigue, and Bladder
+values are worse. Hygiene retains the original V0 convention: 100 is clean and
+0 is filthy.
+
+Migration from schema 1 preserves Fatigue, Bladder, and Hygiene and initializes
+Thirst from defaults. Missing, partial, invalid, infinite, and out-of-range
+fields are repaired through the same normalization path.
+
+## Default simulation and recovery
+
+All tuning is centralized in /oneeds.config.
+
+| Need | Passive default | Recovery |
+| --- | --- | --- |
+| Thirst | 0 to 100 in about 2 hours | Beverage-profile dependent |
+| Fatigue | 0 to 100 in about 4 awake hours | Sleeping recovers 100 in about 3 minutes |
+| Bladder | 0 to 100 in about 6 passive hours | Loungeable toilets relieve 5 points per second |
+| Hygiene | 100 to 0 in about 8 inactive hours | Clean water, rain, and bathing fixtures restore Hygiene |
+
+After all normal and Workshop asset sources load, OpenStarbound's post-load asset
+preprocessor finds the final consumables whose category is drink. It appends an
+invisible, one-shot notifier effect to every existing effect group and creates a
+small generated status-effect definition for that item. On consumption the
+effect messages the consumed item name to the persistent player context, which
+then resolves the final item config. Existing item effects are preserved.
+
+This route avoids the engine consuming the hardcoded `recordEvent` message
+before generic player message handlers, while statistics event scripts cannot
+access world or player callbacks. The default category is drink.
+
+## Beverage depth
+
+Every detected drink resolves a configurable beverage profile. Consumables in
+the drink category are detected automatically; exact item mappings and the
+profile parameter also opt unconventional FU consumables into the system.
+Resolution uses
+the final merged item asset and follows this precedence:
+
+1. The item's `needsBeverageProfile` parameter.
+2. An exact `beverages.itemProfiles` entry.
+3. The first matching configurable name, description, or effect rule.
+4. The standard profile.
+
+Default profiles are deliberately conservative starting points:
+
+| Profile | Thirst change | Bladder change | Fatigue change | Caffeine |
+| --- | ---: | ---: | ---: | ---: |
+| Water | -35 | +20 | 0 | — |
+| Juice | -28 | +16 | 0 | — |
+| Milk/shake | -22 | +14 | 0 | — |
+| Soda/cola | -18 | +18 | 0 | — |
+| Coffee/caffeine | -18 | +20 | -12 | 300 seconds |
+| Alcohol | -5 | +25 | +8 | — |
+| Salty | +10 | +12 | 0 | — |
+| Toxic | +20 | +10 | +5 | — |
+| Standard | -25 | +15 | 0 | — |
+| Solid food | 0 | +5 | 0 | — |
+
+While the invisible `oneeds_caffeinated` effect is active, awake Fatigue gain
+uses the configured multiplier, zero by default. Coffee therefore gives an
+immediate temporary reduction and pauses further awake accumulation for five
+minutes; it does not interfere with the item's existing effects. While the
+effect is active, the `oneeds_caffeinated` effect script reports its own
+remaining `effect.duration()` to the player script, which shows it in
+`/oneeds get` and the Fatigue hover tooltip as m:ss. The readout therefore
+follows the real status effect rather than a second countdown that could drift
+from the game clock. The configured caffeine duration only seeds the display
+until the first report arrives. Alcohol makes
+the player somewhat more tired, provides little hydration, and fills the
+Bladder more strongly. Salty and toxic profiles increase Thirst.
+
+`needsThirstValue`, `needsBladderValue`, `needsFatigueChange`, and
+`needsCaffeineDuration` provide signed per-item overrides. Setting one to false
+disables that component. Exact item maps remain available for FU or other
+Workshop exceptions without editing their assets.
+
+Optional beverage feedback uses short status messages for caffeine, alcohol,
+salty, toxic, or otherwise dehydrating drinks. A shared configurable cooldown
+prevents rapid consumption from flooding the screen. The messages, cooldown,
+and feature toggle are under `beverages.feedback`.
+
+`beverages.returnItems` grants a container back when a listed item is consumed,
+through `player.giveItem`. The default map returns an Empty Bottle for Bottled
+Water. Entries are case-insensitive item-name pairs, the grant runs once on the
+local consumption event, and the feature can be disabled with its `enabled`
+flag. Foods or other drinks can be added the same way.
+
+`/oneeds beverage <itemName>` reports the resolved profile and its source
+(explicit item parameter, exact mapping, classification rule, or default). It
+also reports every signed Needs change and whether each value came from the
+profile, an item parameter, or an override map. This is the preferred way to
+identify and correct FU exceptions.
+
+Toilet relief requires the player to be lounging in an object whose name matches
+the configured toilet patterns. The installed vanilla and FU toilet families use
+those names. Objects may define needsBladderReliefRate to override or disable
+relief.
+
+Hygiene recovery accepts only configured liquid names. The defaults are water
+and healingliquid; hazardous and specialty liquids are excluded. Loungeable
+bath/tub objects also clean the player. Active vanilla showers and baths are
+recognized through their nearby dripping helper objects. A fixture may define
+needsHygieneRecoveryRate for explicit compatibility.
+
+## Food layer
+
+Eating is detected through the same generated notifier used for drinks.
+`register_drinks.lua` registers consumables whose merged category matches either
+`bladder.drinkCategory` (default drink) or `foods.category` (default food), plus
+any item opted in through a profile parameter or exact `itemProfiles` mapping.
+Each registered item gets one invisible one-shot effect that forwards its name
+to the player script.
+
+Resolution mirrors beverages with a separate `foods` section: item parameter,
+exact `foods.itemProfiles`, then ordered `foods.classificationRules`, then
+`foods.defaultProfile`. Food profiles carry the same four fields as drinks
+(thirstRecovery, bladderGain, fatigueChange, caffeineDuration) and are applied by
+the shared consumable path. The generic `needsThirstValue`, `needsBladderValue`,
+`needsFatigueChange`, and `needsCaffeineDuration` parameters therefore work for
+foods too, and a caffeinated food starts the same caffeine effect as a drink.
+
+The default food profiles are conservative: meal and snack increase Thirst
+slightly and add Bladder; juicy fruit restores Thirst; salty food increases it
+strongly; sugary food reduces Fatigue briefly; heavy food adds Fatigue; raw meat
+and toxic food are mild penalties. `/oneeds food <itemName>` and `/oneeds foods`
+mirror the beverage diagnostics and audit so fallbacks and misclassifications
+are easy to find and correct.
+
+## Environmental Hygiene
+
+Environmental Hygiene extends the same stored Hygiene value; the persistence
+schema is unchanged.
+
+- Running and jumping accumulate small additional decay based on actual time in
+  those movement states.
+- Damage taken and damage inflicted are read from heartbeat-based status
+  notification APIs. Loss scales with damage and has a configurable per-update
+  cap, so large or rapidly repeated attacks cannot create an unbounded spike.
+- Explicit clean liquids restore Hygiene at per-liquid rates. Water defaults to
+  2 points per second and healing liquid to 2.5.
+- Dirty liquids are recognized by explicit names, configurable name fragments,
+  or configured liquid status effects. Vanilla poison, swamp water, tar, slime,
+  and fuel are dirty by default. This metadata route can also recognize many FU
+  liquids without patching FU.
+- Rain uses an active configured wet effect while the player is outside liquid
+  and not underground as a client-safe proxy. OpenStarbound exposes additional
+  client weather queries (`world.activeWeather`, `world.weatherStatusEffects`,
+  `world.exposedToWeather`), but the wet-effect proxy is kept so the rain rule
+  behaves the same as the original mod. The default rain/wet recovery is 0.35
+  points per second.
+- Biome and environmental-effect maps multiply passive and activity decay.
+  Defaults cover common hot, toxic, swamp, tar, flesh, and volcanic conditions.
+
+Cleaning suspends passive decay for that update, but activity, dirty-liquid,
+and queued combat losses remain additive. All rates, classifications, biome
+multipliers, and combat coefficients live under hygiene.environment and
+hygiene.combat in /oneeds.config.
+
+## Thresholds and consequences
+
+Every need uses four configurable problem thresholds:
+
+| Tier | Default threshold |
+| --- | ---: |
+| Noticeable | 50 |
+| Serious | 70 |
+| Urgent | 85 |
+| Critical | 95 |
+
+Warnings occur only when crossing upward into a tier. Recovering below a
+threshold rearms that tier. Each need and tier has its own configurable message.
+
+Consequences are need-specific:
+
+- Thirst primarily reduces energy regeneration, then power and speed.
+- Fatigue reduces power, movement, jumping, and at high levels energy regeneration.
+- Bladder pressure primarily reduces movement and jumping, with a modest power
+  penalty at high levels.
+- Dirtiness modestly reduces protection and power.
+
+When several needs are elevated their multipliers combine multiplicatively.
+Configurable safety floors prevent the combined result from dropping below 60%
+speed, 65% jump effectiveness, 50% power, 25% energy regeneration, or 65%
+protection with the default tuning. No tier deals direct damage or kills the
+player. Movement modifiers are submitted per frame; stat modifiers use the
+unique oneeds_penalties persistent category.
+
+No visible status icons, buffs, sounds, or animations are added. Generated drink
+notifier effects are invisible and expire immediately after forwarding the item
+name. The persistent modifier category is cleared whenever needs return below
+warning, penalties are disabled, or the script unloads. Before uninstalling
+while a character is currently penalized, set penalties.enabled to false, load
+that character once, save, and exit cleanly so the namespaced modifier is
+cleared.
+
+## Sleeping
+
+Sleeping is detected exactly as before: the player is lounging and either using
+the sleep emote, under a configured bed effect, or lounging in an object whose
+`sitEmote` is sleep. Detection is defined by `sleep.bedEffects` in
+/oneeds.config.
+
+While sleeping, Fatigue recovers at `fatigue.sleepRecoveryPerSecond`, tuned so a
+full 0-to-100 recharge takes about three minutes at Normal. The Sleep recovery
+setting in the options overlay multiplies that rate (Slow 0.5x, Normal 1x, Fast
+2x). Awake Fatigue gain is unaffected, and caffeine still pauses awake gain.
+
+Sleep acceleration and all application time-scale changes were removed in V1.7.
+Earlier builds changed the whole-game `/timescale` and, in multiplayer, ran a
+Needs-only fallback coordinated by a world-server probe. In singleplayer that
+path could show a false multiplayer message, break world interaction after
+leaving the bed, and hang on Save & Quit. The mod now never touches the game
+clock, sends no chat commands, and adds no world-server or universe callbacks,
+so sleeping is safe to interrupt and Save & Quit is unaffected.
+
+## Circadian rhythm and environment
+
+Fatigue gain while awake is multiplied by several independent factors that are
+combined multiplicatively with the caffeine factor:
+
+- Sleeping recovery is unaffected; these only apply while awake.
+- `fatigue.circadian` uses `world.timeOfDay()` (0.0 to 1.0) and the configurable
+  `nightStart` / `nightEnd` window to choose `nightGainMultiplier` or
+  `dayGainMultiplier`. The window wraps when `nightStart` is greater than
+  `nightEnd`. A missing or unavailable time query falls back to the day value.
+- `fatigue.rested` tracks how long the player has been sleeping. On waking from
+  at least `minimumSleepSeconds`, it applies the invisible `oneeds_rested`
+  status effect for `durationSeconds`, which sets `gainMultiplier` (below 1)
+  while active. An optional message is shown once.
+- `thirst.environment` and `fatigue.environment` mirror the Hygiene environment
+  maps. `biomeGainMultipliers` key on `world.biomeAt`, and
+  `environmentEffectGainMultipliers` key on `world.environmentStatusEffects`
+  names. Both default to 1 and the larger of the two is used.
+
+Biome matching is exact-name first, then an ordered pattern fallback. Each
+`biomeGainMultiplierPatterns` (or `biomeDecayMultiplierPatterns` for Hygiene)
+entry supplies a `multiplier` and a list of case-insensitive, plain-text
+`patterns`; the first pattern contained in the lowercased biome name wins. This
+lets modded variants inherit a base multiplier without listing every world, for
+example `aliendesert` and `desertoasis` match `desert`, and
+`arcticoceanfloor` matches `arctic`. Exact `biomeGainMultipliers` keys always
+take precedence, and any biome matching neither an exact key nor a pattern
+stays at 1.0, so a new or unsupported biome is neutral rather than an error.
+
+Environment multipliers scale passive Thirst gain and awake Fatigue gain; they
+do not affect sleeping recovery, beverage values, or penalties. The `/oneeds
+get` result reports `night`, `circadianMultiplier`, `rested`,
+`thirstEnvironmentMultiplier`, and `fatigueEnvironmentMultiplier`.
+
+## HUD
+
+The HUD uses OpenStarbound's named full-window canvas API. The engine-controlled
+health, energy, hunger, status, FU, and FrackinInterface widgets are untouched.
+
+At runtime the script reads the final loaded
+/interface/windowconfig/teambar.config and derives the active foodBar position
+and width. This follows vanilla, FU, or FrackinInterface geometry and inherits
+interface scale, resolution, window mode, and normal HUD hiding.
+
+Four thin problem meters are drawn below hunger:
+
+1. Thirst
+2. Fatigue
+3. Bladder
+4. Dirtiness, rendered as 100 minus Hygiene
+
+The default layout starts below the horizontal status-effect icon row, so any
+number of normal status icons can extend to the right without crossing the Needs
+meters. The HUD reuses vanilla 16-pixel status artwork at half scale: a blue
+droplet for Thirst, the sleep bubble for Fatigue, a palette-shifted yellow
+droplet for Bladder, and a sparkle for Hygiene. Their nine-pixel row pitch
+leaves one pixel between eight-pixel icons while retaining three-pixel bars.
+Paths, scale, logical size, and spacing are configurable under `hud`; no vanilla
+or FU texture is replaced. Set hud.enabled to false to disable only the HUD. If another
+interface mod removes paneLayout.foodBar, visualization disables itself with a
+warning while simulation continues.
+
+Each draw pass records the four meter hit rectangles, expanding each by half the
+row gap so the thin bars are easy to hover without overlapping adjacent rows.
+When hud.tooltips.enabled is true and the cursor is inside one of those
+rectangles, a compact border-and-fill panel is drawn to the right of the meter
+icons. It lists the need name, the problem-aligned numeric value, the current
+tier, any active recovery state, and the active penalty dimensions for that
+need. The panel is clamped to the canvas, and if there is not enough room to the
+right it is placed to the left instead. It is anchored to the hovered row and
+drawn only while hovered, so no permanent labels are added. Tooltip geometry,
+fonts, and tier colors live under hud.tooltips; disabling it leaves the meters
+and all other HUD behavior untouched. Hygiene recovery source selection is
+tracked while the environment is evaluated so the tooltip can report whether a
+clean liquid, bath/tub, shower/bath, or rain is actively cleaning the player.
+
+## In-game settings
+
+`/oneeds options` toggles a settings panel drawn on the same full-window canvas
+as the meters, so no interface file is replaced. The panel has two sections plus
+a Close button:
+
+- HUD: meters, hover tooltips, compact bars, always-show values, threshold
+  pulse, and each of the four need bars.
+- Gameplay: warnings, consequences, feedback messages, day/night fatigue, rested
+  bonus, and environment effects, plus a Difficulty selector.
+
+Settings live in `storage.oneedsSettings` and are normalized on read. The shape
+is versioned (`settingsVersion = 2`) with `hud` and `gameplay` sub-tables; the
+old V1.11 flat HUD table is migrated automatically. Missing or wrong-typed fields
+fall back to the config defaults from `newHudSettings` / `newGameplaySettings`.
+`hudSettings()`, `gameplaySettings()`, and `rateScale()` return the effective
+values, and the config keeps supplying geometry, colors, fonts, icon paths, and
+the baseline enable flags.
+
+Gameplay toggles gate their features at the existing read sites: warnings in
+`refreshWarningLevels`, consequences in `currentConsequences` and the tooltip,
+feedback in `queueConsumableFeedback`, circadian in `isNightTime` /
+`circadianGainMultiplier`, rested in `restedActive` / `trackSleepRest`, and
+environment in `needEnvironmentMultiplier` / `environmentDecayMultiplier`.
+Difficulty scales the passive Thirst, awake Fatigue, passive Bladder, and
+Hygiene passive/activity decay through `rateScale()`; recovery is unaffected.
+
+Rendering details:
+
+- Compact bars draw at 40% of the derived width and skip icons; the tooltip and
+  always-show-value anchors follow the effective width.
+- Always-show values print `floor(value + 0.5)` beside each bar using the
+  tooltip text color.
+- The threshold pulse brightens a bar for `pulseDuration` seconds when
+  `refreshWarningLevels` detects an upward tier crossing.
+- Rows are built by `buildSettingsRows`; headers are labels, toggles flip a
+  boolean in the `hud` or `gameplay` table, and the Difficulty row cycles
+  through the preset list on click.
+
+Input note: the overlay reads `input.mouseDown("MouseLeft")` and the canvas
+mouse position, so a click that toggles a row can also reach the world as a
+normal left-click. Open the panel when not aiming at anything important. The
+panel itself never replaces or blocks vanilla input.
+
+## Help and localization
+
+`/oneeds help [topic]` prints an overview plus a topic page for `needs`, `tiers`,
+`drinks`, `foods`, `hygiene`, `sleep`, `settings`, or `commands`. The settings
+panel shows a `Type /oneeds help for details` hint.
+
+All help text and the remaining hard-coded system messages live in
+`/oneeds.strings` (JSON). The player script loads it once through
+`root.assetJson` and resolves values with `stringFor(path, default)`; if the
+asset is missing or a key is absent, the built-in English default is used so the
+mod still works. The config still holds gameplay tuning and the warning,
+beverage/food feedback, and rested messages; the strings file covers help and
+the command/system messages.
+
+Translations can ship as an asset patch on `/oneeds.strings` from their own
+mod source, or as a replacement source loaded after this one. Because the loader
+falls back per key, a translation only needs the keys it changes. This is
+documented for other authors in the integrating section.
+
+## Debug commands
+
+The local `/oneeds` slash command is enabled by debug.commandsEnabled:
+
+    /oneeds
+    /oneeds get
+    /oneeds set thirst 95
+    /oneeds set fatigue 70
+    /oneeds set bladder 85
+    /oneeds set hygiene 25
+    /oneeds set dirtiness 75
+    /oneeds set all 85
+    /oneeds add bladder -20
+    /oneeds beverage coffee
+    /oneeds beverage bottledwater
+    /oneeds beverages
+    /oneeds beverages all
+    /oneeds beverages details
+    /oneeds beverages alcohol
+    /oneeds food cookedmeat
+    /oneeds foods
+    /oneeds foods all
+    /oneeds foods details
+    /oneeds foods juicy
+    /oneeds options
+    /oneeds help
+    /oneeds help drinks
+    /oneeds preset normal
+    /oneeds preset noticeable
+    /oneeds preset serious
+    /oneeds preset urgent
+    /oneeds preset critical
+    /oneeds reset
+
+Hygiene is stored as cleanliness, while dirtiness matches the problem-oriented
+HUD fill. Setting all or applying a preset assigns the requested problem value
+to Thirst, Fatigue, Bladder, and Dirtiness. Values and additions are clamped to
+0 through 100. Commands are local to the current player and do not require
+safeScripts to be disabled.
+
+The `/oneeds beverages` and `/oneeds foods` audits enumerate the final loaded
+consumable assets with `root.assetsByExtension`, keep the ones whose merged
+category is the relevant kind (or that opt in through the profile parameter or an
+exact item mapping), and resolve each through the same profile logic used at
+consumption time. With no argument they list only items whose resolution source
+is the plain default, which are the candidates for a new `itemProfiles`
+exception. Passing `all`, a profile name, or a name fragment changes the listing;
+`details` additionally prints each fallback's asset path, source mod via
+`root.assetOrigin`, and the description and effect text used by classification.
+The result is cached per session, so later runs are instant.
+
+Known drink exceptions live in `beverages.itemProfiles`: Corvex Drink and Code
+Zerchesium resolve to soda, Beakeasy Moonshine to alcohol, Blood Chalice to
+standard, and Chewable Magnet plus the raw-meat items whose mod category is
+`drink` (Jarred Fetus, Meat Smoothie, Orphan Paste) resolve to the `solid`
+profile so they give no hydration. Food exceptions go in `foods.itemProfiles`.
+
+The message interface remains available for other scripts:
+
+    world.sendEntityMessage(player.id(), "oneeds.get")
+    world.sendEntityMessage(player.id(), "oneeds.set", "thirst", 75)
+    world.sendEntityMessage(player.id(), "oneeds.set", "fatigue", 75)
+    world.sendEntityMessage(player.id(), "oneeds.set", "bladder", 75)
+    world.sendEntityMessage(player.id(), "oneeds.set", "hygiene", 25)
+    world.sendEntityMessage(player.id(), "oneeds.reset")
+
+OpenStarbound's `/eval` runs in the server script context rather than the
+player context, so the `/oneeds` command remains the supported in-game
+diagnostic interface.
+
+The get result includes sleeping, caffeinated, caffeineRemainingSeconds,
+caffeineRemaining, bladderReliefRate, hygieneRecoveryRate, restRecoveryPerSecond,
+night, circadianMultiplier, rested, thirstEnvironmentMultiplier,
+fatigueEnvironmentMultiplier, hygieneEnvironment, lastHygieneEnvironment,
+pendingCombatDirtiness, penaltyLevel, consequenceLevels, and
+consequenceMultipliers. The command output
+also reports the current biome multiplier, liquid classification, rain/wet
+state, and projected next-tick Hygiene breakdown. Debug handlers reject
+non-local messages.
+
+## Compatibility boundaries
+
+The player.config.patch adds /genericScriptContexts/oneeds. A
+post-load preprocessor generates additive
+patches for final category-drink and category-food consumables after FU and
+Workshop content are loaded. It appends a notifier to their effect groups; it
+does not replace item files or existing effects. FU's deployment and status
+scripts are not edited.
+FrackinInterface and FU may continue to own teambar.config and its textures
+because Needs reads the effective geometry without patching it.
+
+oNeeds requires OpenStarbound. The player script's `init` checks for the
+`interface` canvas API, `interface.queueMessage` fallback handling, and
+`root.assetsByExtension`; if the canvas API is missing (stock Starbound) it
+logs one warning and returns, and `update`/`uninit` no-op while `needsConfig` is
+unset. This avoids error spam on unsupported clients. Because the post-load
+preprocessor and the generic player-script context are provided by
+OpenStarbound, drink and food registration and the HUD only run there; stock
+Starbound and xStarbound are unsupported.
+
+## Integrating other mods
+
+oNeeds is written so another mod can add drinks, foods, and fixtures from its own
+assets without editing Needs. There are four levels, from least to most work.
+
+### Automatic detection
+
+Every consumable whose final merged category is `drink` or `food` is registered
+when all assets load, and classified from its item name, short description,
+description, and effect names. Most mod items need no special handling. The
+category names come from `bladder.drinkCategory` and `foods.category` in
+`/oneeds.config`.
+
+### Per-item parameters (recommended)
+
+A consumable can steer its own resolution by adding any of these namespaced keys,
+either at the top level of the asset or inside its `parameters` object. They are
+safe to ship even when Needs is not installed, because the engine ignores unknown
+fields.
+
+| Key | Type | Meaning |
+| --- | --- | --- |
+| `needsBeverageProfile` | `string` / `table` / `false` | Drinks: named profile, inline profile, or `false` to force the default. |
+| `needsFoodProfile` | `string` / `table` / `false` | Foods: same, using the `foods` profiles. |
+| `needsThirstValue` | `number` / `false` | Signed Thirst change (positive hydrates). `false` disables the thirst component. |
+| `needsBladderValue` | `number` / `false` | Signed Bladder change. `false` disables it. |
+| `needsFatigueChange` | `number` / `false` | Signed Fatigue change. `false` disables it. |
+| `needsCaffeineDuration` | `number` / `false` | Caffeine seconds. `false` disables it. |
+
+A string must name a profile in the corresponding section (`beverages.profiles`
+or `foods.profiles`). A table is used as an inline profile and must supply
+`thirstRecovery`, `bladderGain`, `fatigueChange`, and optionally
+`caffeineDuration`:
+
+```json
+{
+  "itemName": "myenergydrink",
+  "category": "drink",
+  "needsBeverageProfile": {
+    "thirstRecovery": 20,
+    "bladderGain": 18,
+    "fatigueChange": -10,
+    "caffeineDuration": 240
+  }
+}
+```
+
+For a consumable outside the `drink` and `food` categories, set the profile key
+at the top level to opt it in; this is also how a mod registers a non-standard
+category item with Needs.
+
+### Object parameters
+
+Loungeable fixtures can define `needsBladderReliefRate` (toilets) and
+`needsHygieneRecoveryRate` (showers/baths) to override or disable Needs'
+default recognition, including `false` to opt out.
+
+### Patching the Needs config (advanced)
+
+A mod may also patch `/oneeds.config` to add named profiles, item mappings, or
+classification rules shared by many items. This relies on asset load order and
+should be a last resort; per-item parameters are more robust.
+
+Existing exact mappings used for misclassified items are listed under
+`beverages.itemProfiles` and `foods.itemProfiles`; a mod author can read those as
+examples.
+
+The `/oneeds beverages details` and `/oneeds foods details` audits report each
+item's profile, resolution source, asset path, and source mod, which is the
+fastest way to confirm how a given item is treated.
+
+### Localization
+
+Translators can provide an asset patch on `/oneeds.strings` from their own
+mod to translate the help text and system messages, or ship a replacement
+source loaded after this one. Because `stringFor` falls back per key, only the
+translated keys are required. Gameplay messages that live in
+`oneeds.config` (warnings, beverage/food feedback, rested message) can be
+patched the same way.
+
+Object and item extension parameters are optional and uniquely prefixed. V1 adds
+no new furniture, consumables, effect-status icons, menus, sounds, or
+animations. The four Needs meter icons are HUD-only uses of existing vanilla
+artwork.
+
+## Singleplayer validation checklist
+
+Run these after any change to script, config, or generated patches. Everything
+here is singleplayer only; multiplayer is out of scope for V1.
+
+Persistence and teardown:
+
+1. Load an existing character and confirm Thirst, Fatigue, Bladder, and Hygiene
+   restore and the HUD appears with no red script errors.
+2. Force each need into a penalty tier, save, and quit. Confirm the game exits
+   promptly with no hang and no error during universe shutdown.
+3. Reload the character. Confirm needs, warning tiers, and the namespaced
+   modifier category are consistent and the HUD returns.
+
+Sleep and time:
+
+1. Sleep in a bed and confirm no button appears and the game remains at normal
+   speed (`/timescale` reads `1.000000` throughout).
+2. Confirm sleeping restores Fatigue from 100 to 0 in roughly three minutes.
+3. Sleep for more than the rested minimum, wake, and confirm the Rested message
+   appears and `/oneeds get` reports `rested: true`.
+4. Wait for night and confirm `/oneeds get` reports `night: true` and a
+   `circadianMultiplier` above 1.
+5. Get out of the bed and confirm movement and world interaction still work.
+6. Confirm a caffeine drink counts down from `5:00` at 1x wall-clock while
+   `/oneeds get` reports `Caffeinated: yes (m:ss remaining)`.
+
+Recovery and environment:
+
+1. Lounge on a toilet and confirm Bladder drops at the configured rate.
+2. Stand in clean water and in an active shower/bath and confirm Hygiene rises
+   and the hover tooltip names the recovery source.
+3. Take damage and run/jump and confirm Dirtiness rises without unbounded spikes.
+4. Visit a hot and a cold biome and confirm `/oneeds get` reports the expected
+   `thirstEnvironmentMultiplier` / `fatigueEnvironmentMultiplier` values and the
+   matching hover tooltip lines.
+
+Beverages, food, and HUD:
+
+1. Run `/oneeds beverages` and `/oneeds foods` and confirm each reports
+   `default fallbacks (0)`.
+2. Spot-check water, coffee, soda, alcohol, salty, and toxic examples with
+   `/oneeds beverage <itemName>`.
+3. Eat a plain meal, a juicy fruit, a salty food, and a sugary food and confirm
+   the expected Thirst/Bladder/Fatigue changes with `/oneeds food <itemName>`.
+4. Hover each need meter and confirm name, value, tier, recovery, and penalty
+   rows are correct and do not overlap the status row.
+5. Change interface scale and window size and confirm the meters and tooltips
+   stay aligned.
+
+Settings overlay:
+
+1. Run `/oneeds options` and confirm the panel opens centered with HUD and
+   Gameplay sections, all toggles reflecting current values, and the Difficulty
+   row showing the active preset.
+2. Toggle each HUD option and confirm it applies immediately: meters hide,
+   tooltips stop, bars shorten without icons, values appear, and a threshold
+   crossing pulses.
+3. Toggle each gameplay option and confirm it takes effect: warnings stop,
+   consequence multipliers clear, feedback stops, and day/night, rested, and
+   environment modifiers report off in `/oneeds get`.
+4. Cycle Difficulty and confirm `/oneeds get` reports the new `rateScale` and
+   that passive gains change accordingly.
+5. Save and quit, then reload, and confirm all settings persisted.
+6. Close with the button and with `/oneeds options`.
+
+Help and strings:
+
+1. Run `/oneeds help` and confirm the topic list, then `/oneeds help <topic>`
+   for each topic.
+2. Temporarily patch a key in `/oneeds.strings` and confirm the changed text
+   appears, then remove the patch and confirm the built-in default returns.
+
+Safe removal:
+
+1. Set `consequences.enabled` to `false`, load the penalized character once, and
+   save and quit cleanly so `oneeds_penalties` is cleared.
+2. Remove the mod and confirm the character loads without leftover modifiers.
