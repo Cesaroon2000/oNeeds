@@ -23,6 +23,9 @@ OpenStarbound port.
 
 ### Changed
 
+- The settings overlay now uses a responsive multi-column layout, so it stays
+  on screen at low resolutions or large interface scales instead of running off
+  the top and bottom.
 - Retargeted the mod from xStarbound to OpenStarbound. The mod no longer
   requires the `xSBassets` dependency and loads on a stock OpenStarbound
   install.
